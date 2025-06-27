@@ -1,0 +1,8 @@
+fal-client
+supabase
+python-dotenv
+pillow
+httpx
+aiofiles
+requests
+beautifulsoup4
