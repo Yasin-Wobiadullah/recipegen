@@ -8,6 +8,7 @@ import fal_client
 import httpx
 from PIL import Image
 import io
+import re
 
 # --- Configuration ---
 load_dotenv() # Load variables from .env file
@@ -38,7 +39,19 @@ except Exception as e:
     print("Please ensure SUPABASE_URL and SUPABASE_KEY are set correctly in your .env file.")
     exit()
 
-async def process_recipe(recipe: dict, httpx_client: httpx.AsyncClient):
+def slugify(text: str) -> str:
+    """Converts a string into a URL-friendly slug."""
+    text = text.replace('|', ' ')
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s-]', '', text) # Remove punctuation except spaces and hyphens
+    text = re.sub(r'[\s_]+', '-', text) # Replace spaces and underscores with hyphens
+    text = re.sub(r'--+', '-', text) # Replace multiple hyphens with a single one
+    text = text.strip('-')
+    if not text:
+        return str(uuid.uuid4()) # Return a unique ID if slug is empty
+    return text
+
+async def process_recipe(recipe: dict, recipe_path: str, httpx_client: httpx.AsyncClient, semaphore: asyncio.Semaphore):
     """Handles the full processing pipeline for a single recipe asynchronously."""
     recipe_title = recipe.get('title', 'Untitled')
     source_image_url = recipe.get('image_url')
@@ -46,55 +59,76 @@ async def process_recipe(recipe: dict, httpx_client: httpx.AsyncClient):
 
     print(f"Processing: {recipe_title}")
 
-    try:
-        # 1. Submit job to Fal.ai
-        print(f"  - Submitting to Fal.ai for '{recipe_title}'")
-        handler = fal_client.submit(FAL_MODEL_ID, arguments={"image_url": source_image_url, **FAL_PARAMS})
-        
-        # 2. Wait for the result (this blocks but we run it in a thread to not block asyncio event loop)
-        result = await asyncio.to_thread(handler.get)
-        generated_image_url = result['images'][0]['url']
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2  # seconds
 
-        # 3. Download the generated image
-        print(f"  - Downloading generated image for '{recipe_title}'")
-        response = await httpx_client.get(generated_image_url)
-        response.raise_for_status()
-        image_bytes = response.content
+    async with semaphore:
+        for attempt in range(MAX_RETRIES):
+            try:
+                # 1. Submit job to Fal.ai
+                print(f"  - Submitting to Fal.ai for '{recipe_title}'")
+                handler = await asyncio.to_thread(
+                    fal_client.submit, FAL_MODEL_ID, arguments={"image_url": source_image_url, **FAL_PARAMS}
+                )
+                result = await asyncio.to_thread(handler.get)
 
-        # 4. Convert to WebP in memory
-        print(f"  - Converting to WebP for '{recipe_title}'")
-        with Image.open(io.BytesIO(image_bytes)) as img:
-            with io.BytesIO() as output_buffer:
-                img.save(output_buffer, format="WEBP", quality=85)
-                webp_bytes = output_buffer.getvalue()
+                if not result or 'images' not in result or not result['images']:
+                    raise ValueError("Fal.ai returned no images.")
 
-        # 5. Upload to Supabase
-        upload_path = f"{recipe_slug}.webp"
-        print(f"  - Uploading to Supabase at '{upload_path}'")
-        supabase.storage.from_(SUPABASE_BUCKET).upload(
-            path=upload_path,
-            file=webp_bytes,
-            file_options={"content-type": "image/webp", "upsert": "true"}
-        )
-        public_url_data = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(upload_path)
-        supabase_image_url = public_url_data
+                generated_image_url = result['images'][0]['url']
 
-        # 6. Update the local recipe JSON file
-        recipe_json_path = os.path.join(RECIPES_DIR, f"{recipe_slug}.json")
-        print(f"  - Updating local file: {recipe_json_path}")
-        with open(recipe_json_path, 'r+') as f:
-            data = json.load(f)
-            data['generated_image_url'] = supabase_image_url
-            f.seek(0)
-            json.dump(data, f, indent=2)
-            f.truncate()
+                # 2. Download the generated image
+                print(f"  - Downloading generated image for '{recipe_title}'")
+                response = await httpx_client.get(generated_image_url)
+                response.raise_for_status()
+                image_bytes = response.content
 
-        print(f"✅ Successfully processed: {recipe_title}")
-        return supabase_image_url
+                # 3. Convert to WebP in memory (using a thread for the CPU-bound task)
+                print(f"  - Converting to WebP for '{recipe_title}'")
+                def convert_to_webp(img_bytes):
+                    with Image.open(io.BytesIO(img_bytes)) as img:
+                        with io.BytesIO() as output_buffer:
+                            img.save(output_buffer, format="WEBP", quality=85)
+                            return output_buffer.getvalue()
+                webp_bytes = await asyncio.to_thread(convert_to_webp, image_bytes)
 
-    except Exception as e:
-        print(f"❌ Error processing '{recipe_title}': {e}")
-        return None
+                # 4. Upload to Supabase (using a thread for the blocking SDK call)
+                upload_path = f"{recipe_slug}.webp"
+                print(f"  - Uploading to Supabase at '{upload_path}'")
+                await asyncio.to_thread(
+                    supabase.storage.from_(SUPABASE_BUCKET).upload,
+                    path=upload_path,
+                    file=webp_bytes,
+                    file_options={"content-type": "image/webp", "upsert": "true"}
+                )
+                public_url_data = await asyncio.to_thread(
+                    supabase.storage.from_(SUPABASE_BUCKET).get_public_url, upload_path
+                )
+                supabase_image_url = public_url_data
+
+                # 5. Update the local recipe JSON file (using a thread for blocking file I/O)
+                print(f"  - Updating local file: {recipe_path}")
+                def update_json_file():
+                    with open(recipe_path, 'r+') as f:
+                        data = json.load(f)
+                        data['generated_image_url'] = supabase_image_url
+                        f.seek(0)
+                        json.dump(data, f, indent=2)
+                        f.truncate()
+                await asyncio.to_thread(update_json_file)
+
+                print(f"✅ Successfully processed: {recipe_title}")
+                return supabase_image_url # Success, exit the retry loop
+
+            except Exception as e:
+                if "Resource temporarily unavailable" in str(e) and attempt < MAX_RETRIES - 1:
+                    wait_time = RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+                    print(f"⏳ Retrying '{recipe_title}' (attempt {attempt + 2}/{MAX_RETRIES}) after {wait_time}s... Error: {e}")
+                    await asyncio.sleep(wait_time)
+                    continue # Go to the next attempt
+                else:
+                    print(f"❌ Error processing '{recipe_title}' after {attempt + 1} attempts: {e}")
+                    return None # Permanent failure
 
 async def main():
     """Main function to orchestrate the batch processing."""
@@ -114,13 +148,18 @@ async def main():
         try:
             with open(recipe_path, 'r') as f:
                 recipe = json.load(f)
-                # Check if already processed
                 if 'generated_image_url' in recipe and recipe['generated_image_url']:
                     already_processed_count += 1
                     continue
-                # Check for source image
+
+                # Generate slug from title if it doesn't exist
+                if 'slug' not in recipe or not recipe.get('slug'):
+                    title = recipe.get('title')
+                    if title:
+                        recipe['slug'] = slugify(title)
+
                 if recipe.get('image_url') and recipe.get('slug'):
-                    recipes_to_process.append(recipe)
+                    recipes_to_process.append((recipe, recipe_path))
                 else:
                     recipes_missing_image.append(recipe.get('title', 'Untitled Recipe'))
         except (json.JSONDecodeError, IOError) as e:
@@ -128,16 +167,20 @@ async def main():
 
     print(f"Found {len(all_recipe_files)} total recipe files.")
     print(f"- {already_processed_count} are already processed.")
-    print(f"- {len(recipes_missing_image)} are missing a source image URL.")
+    print(f"- {len(recipes_missing_image)} are missing a source image URL or slug.")
     print(f"- {len(recipes_to_process)} new recipes to process.")
 
     if not recipes_to_process:
         print("\nNo new recipes to process. Exiting.")
         return
 
+    # Limit concurrency to avoid overwhelming the API service
+    CONCURRENT_LIMIT = 10
+    semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
+
     # Create a single httpx client for all requests
     async with httpx.AsyncClient(timeout=60.0) as httpx_client:
-        tasks = [process_recipe(recipe, httpx_client) for recipe in recipes_to_process]
+        tasks = [process_recipe(recipe, path, httpx_client, semaphore) for recipe, path in recipes_to_process]
         results = await asyncio.gather(*tasks)
 
     print("\n--- Batch Processing Complete ---")
@@ -145,7 +188,7 @@ async def main():
     print(f"Successfully generated and uploaded {successful_count} new images.")
 
     if recipes_missing_image:
-        print("\nThe following recipes were skipped because they had no source image URL:")
+        print("\nThe following recipes were skipped because they had no source image URL or slug:")
         for title in recipes_missing_image:
             print(f"- {title}")
 
